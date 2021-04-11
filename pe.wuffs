@@ -1,0 +1,183 @@
+pri status "#bad MS-DOS e_magic"
+pri status "#e_lfanew is 0, is this a PE executable?"
+pri status "#bad PE signature"
+pri status "#too many sections"
+
+pri const IMAGE_FILE_MACHINE_AMD64 : base.u16 = 0x8664
+pri const IMAGE_FILE_MACHINE_ARM64 : base.u16 = 0xAA64
+
+pub struct image_data_directory?(
+	virtual_address : base.u32,
+	size            : base.u32,
+)
+
+pub struct image_section_header?(
+	name                   : array[8] base.u8,
+	virtual_size           : base.u32,
+	virtual_address        : base.u32,
+	size_of_raw_data       : base.u32,
+	pointer_to_raw_data    : base.u32,
+	pointer_to_relocations : base.u32,
+	number_of_relocations  : base.u16,
+	characteristics        : base.u32,
+	// ignored PointerToLinenumbers and NumberOfLinenumbers because COFF debugging information is deprecated
+)
+
+pub struct parser?(
+	file_header_pos : base.u32,
+
+	image_machine         : base.u16,
+	number_of_sections    : base.u16,
+	image_timestamp       : base.u32,
+	image_characteristics : base.u16,
+
+	image_data_directories : array[16] image_data_directory,
+	image_sections         : array[96] image_section_header,
+)
+
+pub func parser.parse?(src: base.io_reader) {
+	var e_magic  : base.u16
+	var e_lfanew : base.u32
+
+	e_magic = args.src.read_u16le?()
+	if e_magic <> 'MZ'le {
+		return "#bad MS-DOS e_magic"
+	}
+
+	// skip over the MS-DOS header to get the address of the PE header
+	args.src.skip?(n: 58)
+
+	e_lfanew = args.src.read_u32le?()
+	if e_lfanew == 0 {
+		return "#e_lfanew is 0, is this a PE executable?"
+	}
+
+	this.file_header_pos = e_lfanew
+}
+
+// https://docs.microsoft.com/en-us/windows/win32/debug/pe-format#coff-file-header-object-and-image
+pub func parser.read_image_file_header?(src: base.io_reader) {
+	var signature               : base.u32
+	var machine                 : base.u16
+	var number_of_sections      : base.u16
+	var timestamp               : base.u32
+	var size_of_optional_header : base.u16
+	var characteristics         : base.u16
+
+	signature = args.src.read_u32le?()
+	if signature <> 'PE\x00\x00'le {
+		return "#bad PE signature"
+	}
+
+	machine = args.src.read_u16le?()
+	number_of_sections = args.src.read_u16le?()
+	timestamp = args.src.read_u32le?()
+
+	// the Windows loader limits the number of sections to 96
+	if number_of_sections >= 96 {
+		return "#too many sections"
+	}
+
+	// skip over deprecated COFF debugging information
+	args.src.skip?(n: 8)
+
+	size_of_optional_header = args.src.read_u16le?()
+	characteristics = args.src.read_u16le?()
+
+	this.number_of_sections = number_of_sections
+	this.image_machine = machine
+	this.image_timestamp = timestamp
+	this.image_characteristics = characteristics
+
+	this.read_optional_header?(src: args.src)
+
+	// also read section headers
+	this.read_section_headers?(src: args.src)
+}
+
+// https://docs.microsoft.com/en-us/windows/win32/debug/pe-format#optional-header-image-only
+pub func parser.read_optional_header?(src: base.io_reader) {
+	var magic : base.u16
+
+	magic = args.src.read_u16le?()
+
+	// TODO size_of_optional_header checks in read code
+	// TODO use optional header magic instead?
+	if (this.image_machine == IMAGE_FILE_MACHINE_AMD64) or (this.image_machine == IMAGE_FILE_MACHINE_ARM64) {
+		this.read_image_optional_header64?(src: args.src)
+	} else {
+		this.read_image_optional_header?(src: args.src)
+	}
+}
+
+// read image_optional_header
+pub func parser.read_image_optional_header?(src: base.io_reader) {
+	// TODO parse the entire optional header
+	// skip to data directories
+	args.src.skip?(n: 94)
+
+	this.read_data_directories?(src: args.src)
+}
+
+// image_optional_header64 PE32+
+pub func parser.read_image_optional_header64?(src: base.io_reader) {
+	// TODO parse the entire optional header
+	// skip to data directories
+	args.src.skip?(n: 110)
+
+	this.read_data_directories?(src: args.src)
+}
+
+// https://docs.microsoft.com/en-us/windows/win32/debug/pe-format#optional-header-data-directories-image-only
+pub func parser.read_data_directories?(src: base.io_reader) {
+	var i         : base.u8
+	var directory : image_data_directory
+
+	i = 0
+	while i < 16 {
+		directory.virtual_address = args.src.read_u32le?()
+		directory.size = args.src.read_u32le?()
+		this.image_data_directories[i] = directory
+
+		i += 1
+	} endwhile
+}
+
+// https://docs.microsoft.com/en-us/windows/win32/debug/pe-format#section-table-section-headers
+pub func parser.read_section_headers?(src: base.io_reader) {
+	var i       : base.u16
+	var j       : base.u16
+	var section : image_section_header
+
+	i = 0
+
+	while i < this.number_of_sections {
+		j = 0
+
+		// read the section name
+		while j < 8 {
+			section.name[j] = args.src.read_u8?()
+			j += 1
+		} endwhile
+
+		section.virtual_size = args.src.read_u32le?()
+		section.virtual_address = args.src.read_u32le?()
+		section.size_of_raw_data = args.src.read_u32le?()
+		section.pointer_to_raw_data = args.src.read_u32le?()
+		section.pointer_to_relocations = args.src.read_u32le?()
+
+		args.src.skip?(n: 4)  // PointerToLinenumbers, deprecated
+		section.number_of_relocations = args.src.read_u16le?()
+
+		args.src.skip?(n: 2)  // NumberOfLinenumbers, deprecated
+		section.characteristics = args.src.read_u32le?()
+
+		// the compiler doesn't trust me even though I checked before
+		if i >= 96 {
+			return "#too many sections"
+		}
+
+		this.image_sections[i] = section
+		i += 1
+	} endwhile
+}
